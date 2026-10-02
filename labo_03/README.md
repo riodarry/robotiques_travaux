@@ -14,6 +14,6 @@ Pour la suite : ajouter les segments, le sonar, les pivots et les DEL de fin.
 
 ## Cours utilises
 
-- [FSM avec firstTime](https://github.com/nbourre/1SX_robotique/blob/0941ad14f74b80703fee6ec92e0c7fbae76611d9/autres/modele_fsm/modele_fsm.ino)
-- [Delais sans delay](https://nbourre.github.io/1sx_cours_notes/1SX_cours_01b_rappels_no_delay/01_delai_sans_delay/)
-- [DEL et moteurs](https://nbourre.github.io/1sx_cours_notes/1SX_cours_04_dels_moteurs/)
+- [FSM avec firstTime (GitHub du professeur)](https://github.com/nbourre/1SX_robotique/blob/0941ad14f74b80703fee6ec92e0c7fbae76611d9/autres/modele_fsm/modele_fsm.ino)
+- [Delais sans delay : explication et code](https://nbourre.github.io/1sx_cours_notes/1SX_cours_01b_rappels_no_delay/01_delai_sans_delay/#d%C3%A9lai-sans-delay)
+- [Anneau de DEL : explication et code](https://nbourre.github.io/1sx_cours_notes/1SX_cours_04_dels_moteurs/#lumi%C3%A8re-avant-tout)
