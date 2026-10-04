@@ -1,13 +1,13 @@
 #include <MeAuriga.h>
 
-// Labo 03 : integration 2 du prototype existant.
-// DA 2409626, derniers chiffres 26 : gauche puis droite (pivots a venir).
-// Version partielle : arret apres le segment 1, sans sonar ni pivot.
+// Labo 03 : integration 3 du prototype existant.
+// DA 2409626, derniers chiffres 26 : gauche puis droite.
+// Version partielle : arret apres le premier pivot, sans sonar.
 
 #define LEDNUM 12
 #define LEDPIN 44
 
-enum AppState { SETUP_STATE, SEGMENT_1_STATE, READY_STATE, FAULT_STATE };
+enum AppState { SETUP_STATE, SEGMENT_1_STATE, PIVOT_1_STATE, READY_STATE, FAULT_STATE };
 AppState appState = SETUP_STATE;
 
 MeRGBLed led(PORT0, LEDNUM);
@@ -18,6 +18,9 @@ MeEncoderOnBoard encoderLeft(SLOT2);
 const int ENCODER_PULSES = 9;
 const float ENCODER_RATIO = 39.267;
 const float WHEEL_CIRCUMFERENCE_CM = 20.26;
+const float FULL_SPIN_CIRCUMFERENCE_CM = 47.44;
+const int FIRST_PIVOT_DEG = -90;
+const int PIVOT_SPEED_RPM = 60;
 const float SEGMENT_1_DISTANCE_CM = 100.0; // X a remplacer a l'evaluation.
 const int STRAIGHT_PWM = 120;
 const int APPROACH_PWM = 80;
@@ -33,10 +36,16 @@ const int LED_BRIGHTNESS = 10;
 const unsigned long START_DELAY_MS = 3000;
 const unsigned long SERIAL_RATE_MS = 250;
 const unsigned long SEGMENT_TIMEOUT_MS = 20000;
+const unsigned long PIVOT_TIMEOUT_MS = 6000;
+const unsigned long PIVOT_SETTLE_MS = 200;
 const bool DEBUG_ENABLED = true;
 unsigned long currentTime = 0;
 long segmentStartLeftDeg = 0;
 long segmentStartRightDeg = 0;
+float segment1DistanceCm = 0.0;
+bool pivotSettling = false;
+unsigned long pivotReachedTime = 0;
+bool pivotTimeoutDetected = false;
 
 void rightEncoderInterrupt() {
   if (digitalRead(encoderRight.getPortB()) == 0) {
@@ -107,6 +116,9 @@ void stateManager(unsigned long cT) {
       break;
     case SEGMENT_1_STATE:
       segment1State(cT);
+      break;
+    case PIVOT_1_STATE:
+      pivot1State(cT);
       break;
     case READY_STATE:
       readyState();
@@ -184,6 +196,34 @@ void goStraight(int speed, bool firstRun) {
   encoderRight.setTarPWM(-speed - correction);
 }
 
+// Calcul de spin() du professeur, en cm.
+void spin(int goal) {
+  stopMotors();
+  pivotSettling = false;
+  float ratioSpin = (goal * 1.0) / 360.0;
+  float dist = ratioSpin * FULL_SPIN_CIRCUMFERENCE_CM;
+  float nbRots = dist / WHEEL_CIRCUMFERENCE_CM;
+  long angleLeft = nbRots * 360.0;
+  long angleRight = angleLeft;
+  encoderLeft.move(angleLeft, PIVOT_SPEED_RPM);
+  encoderRight.move(angleRight, PIVOT_SPEED_RPM);
+}
+
+bool pivotReached(unsigned long cT) {
+  bool motorsReached = encoderLeft.isTarPosReached()
+                    && encoderRight.isTarPosReached();
+  if (!motorsReached) {
+    pivotSettling = false;
+    return false;
+  }
+  if (!pivotSettling) {
+    pivotSettling = true;
+    pivotReachedTime = cT;
+    return false;
+  }
+  return cT - pivotReachedTime >= PIVOT_SETTLE_MS;
+}
+
 void setupState(unsigned long cT) {
   static bool firstTime = true;
   static unsigned long startTime = 0;
@@ -215,6 +255,7 @@ void segment1State(unsigned long cT) {
     startTime = cT;
     segmentStartLeftDeg = encoderLeft.getCurPos();
     segmentStartRightDeg = encoderRight.getCurPos();
+    segment1DistanceCm = 0.0;
     showProgress(0.0, FIRST_SEGMENT_MARKER_LED);
     goStraight(STRAIGHT_PWM, true);
     if (DEBUG_ENABLED) {
@@ -223,19 +264,21 @@ void segment1State(unsigned long cT) {
     return;
   }
   float travelledCm = getSegmentDistanceCm();
+  segment1DistanceCm = travelledCm;
   showProgress(travelledCm / SEGMENT_1_DISTANCE_CM, FIRST_SEGMENT_MARKER_LED);
   bool transitionTimeout = cT - startTime >= SEGMENT_TIMEOUT_MS;
-  bool transitionReady = travelledCm >= SEGMENT_1_DISTANCE_CM;
+  bool transitionPivot1 = travelledCm >= SEGMENT_1_DISTANCE_CM;
   if (transitionTimeout) {
     stopMotors();
+    pivotTimeoutDetected = false;
     firstTime = true;
     appState = FAULT_STATE;
     return;
   }
-  if (transitionReady) {
+  if (transitionPivot1) {
     stopMotors();
     firstTime = true;
-    appState = READY_STATE;
+    appState = PIVOT_1_STATE;
     return;
   }
   int speed = STRAIGHT_PWM;
@@ -245,6 +288,36 @@ void segment1State(unsigned long cT) {
   goStraight(speed, false);
 }
 
+void pivot1State(unsigned long cT) {
+  static bool firstTime = true;
+  static unsigned long startTime = 0;
+  if (firstTime) {
+    firstTime = false;
+    startTime = cT;
+    pivotTimeoutDetected = false;
+    spin(FIRST_PIVOT_DEG);
+    if (DEBUG_ENABLED) {
+      Serial.println("Entree : PIVOT 1 - GAUCHE 90 DEGRES");
+    }
+    return;
+  }
+  bool transitionTimeout = cT - startTime >= PIVOT_TIMEOUT_MS;
+  bool transitionReady = pivotReached(cT);
+  // Le delai maximum reste prioritaire.
+  if (transitionTimeout) {
+    stopMotors();
+    pivotTimeoutDetected = true;
+    firstTime = true;
+    appState = FAULT_STATE;
+    return;
+  }
+  if (transitionReady) {
+    stopMotors();
+    firstTime = true;
+    appState = READY_STATE;
+  }
+}
+
 void readyState() {
   static bool firstTime = true;
   if (firstTime) {
@@ -252,7 +325,7 @@ void readyState() {
     stopMotors();
     showProgress(1.0, FIRST_SEGMENT_MARKER_LED);
     if (DEBUG_ENABLED) {
-      Serial.println("Entree : SEGMENT 1 TERMINE - PIVOT NON INTEGRE");
+      Serial.println("Entree : PIVOT 1 TERMINE - SEGMENT 2 NON INTEGRE");
     }
     return;
   }
@@ -265,7 +338,11 @@ void faultState() {
     firstTime = false;
     stopMotors();
     if (DEBUG_ENABLED) {
-      Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 1");
+      if (pivotTimeoutDetected) {
+        Serial.println("Entree : ARRET - TEMPS MAXIMUM PIVOT 1");
+      } else {
+        Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 1");
+      }
     }
     return;
   }
@@ -283,11 +360,7 @@ void serialTask(unsigned long cT) {
   Serial.print(" ms | Etat : ");
   Serial.print((int)appState);
   Serial.print(" | Distance : ");
-  float travelledCm = 0.0;
-  if (appState != SETUP_STATE) {
-    travelledCm = getSegmentDistanceCm();
-  }
-  Serial.print(travelledCm, 1);
+  Serial.print(segment1DistanceCm, 1);
   Serial.print(" cm | Angle Z : ");
   Serial.println(gyro.getAngleZ(), 1);
 }
