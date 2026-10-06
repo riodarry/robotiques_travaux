@@ -1,19 +1,24 @@
 #include <MeAuriga.h>
 
-// Labo 03 : integration 3 du prototype existant.
+// Labo 03 : integration 4 du prototype existant.
 // DA 2409626, derniers chiffres 26 : gauche puis droite.
-// Version partielle : arret apres le premier pivot, sans sonar.
+// Version partielle : arret apres le segment 2, sans second pivot.
 
 #define LEDNUM 12
 #define LEDPIN 44
 
-enum AppState { SETUP_STATE, SEGMENT_1_STATE, PIVOT_1_STATE, READY_STATE, FAULT_STATE };
+enum AppState { SETUP_STATE, SEGMENT_1_STATE, PIVOT_1_STATE, SEGMENT_2_STATE,
+                READY_STATE, FAULT_STATE };
 AppState appState = SETUP_STATE;
+enum FaultReason { SEGMENT_1_TIMEOUT, PIVOT_1_TIMEOUT, SEGMENT_2_TIMEOUT,
+                   SONAR_CHANGE, OBSTACLE_TOO_CLOSE };
+FaultReason faultReason = SEGMENT_1_TIMEOUT;
 
 MeRGBLed led(PORT0, LEDNUM);
 MeGyro gyro(0, 0x69);
 MeEncoderOnBoard encoderRight(SLOT1);
 MeEncoderOnBoard encoderLeft(SLOT2);
+MeUltrasonicSensor sonar(PORT_10);
 
 const int ENCODER_PULSES = 9;
 const float ENCODER_RATIO = 39.267;
@@ -28,10 +33,19 @@ const float SLOW_APPROACH_DISTANCE_CM = 15.0;
 const double STRAIGHT_KP = 6.75;
 const double STRAIGHT_KD = 1.0;
 const double MAX_STRAIGHT_CORRECTION = 60.0;
+const float OBSTACLE_STOP_DISTANCE_CM = 30.0;
+const float STOP_TOLERANCE_CM = 2.0;
+const int ARRIVAL_READINGS = 3;
+const float SONAR_MIN_CM = 2.0;
+const float SONAR_MAX_CM = 400.0;
+const float MAX_SONAR_CHANGE_CM = 20.0; // Controle conservateur, non calibre.
+const unsigned long SONAR_RATE_MS = 100;
+const unsigned long SONAR_TIMEOUT_US = 25000;
 
 const int PROGRESS_LED_COUNT = 7;
 const int START_MARKER_LED = 8;
 const int FIRST_SEGMENT_MARKER_LED = 12;
+const int SECOND_SEGMENT_MARKER_LED = 11;
 const int LED_BRIGHTNESS = 10;
 const unsigned long START_DELAY_MS = 3000;
 const unsigned long SERIAL_RATE_MS = 250;
@@ -45,7 +59,16 @@ long segmentStartRightDeg = 0;
 float segment1DistanceCm = 0.0;
 bool pivotSettling = false;
 unsigned long pivotReachedTime = 0;
-bool pivotTimeoutDetected = false;
+float segment2DistanceCm = 0.0;
+float segment2ExpectedDistanceCm = 0.0;
+float distanceCm = -1.0;
+float previousSonarCm = 0.0;
+unsigned long sonarPrevious = 0;
+bool sonarReady = false;
+bool sonarFresh = false;
+bool sonarHasPrevious = false;
+bool sonarChangeDetected = false;
+int arrivalCount = 0;
 
 void rightEncoderInterrupt() {
   if (digitalRead(encoderRight.getPortB()) == 0) {
@@ -105,6 +128,7 @@ void loop() {
   encoderLeft.loop();
   currentTime = millis();
   stateManager(currentTime);
+  currentTime = millis();
   serialTask(currentTime);
 }
 
@@ -119,6 +143,9 @@ void stateManager(unsigned long cT) {
       break;
     case PIVOT_1_STATE:
       pivot1State(cT);
+      break;
+    case SEGMENT_2_STATE:
+      segment2State(cT);
       break;
     case READY_STATE:
       readyState();
@@ -151,7 +178,45 @@ void showProgress(float progress, int stageLed) {
     led.setColor(i, 0, 0, LED_BRIGHTNESS);
   }
   led.setColor(stageLed, 0, LED_BRIGHTNESS, 0);
+  if (stageLed == SECOND_SEGMENT_MARKER_LED) {
+    led.setColor(FIRST_SEGMENT_MARKER_LED, 0, LED_BRIGHTNESS, 0);
+  }
   led.show();
+}
+
+void sonarTask(unsigned long cT) {
+  sonarFresh = false;
+  if (cT - sonarPrevious < SONAR_RATE_MS) {
+    return;
+  }
+  sonarPrevious = cT;
+  sonarFresh = true;
+  sonarReady = false;
+  distanceCm = -1.0;
+  // Impulsion du cours; signal unique du sonar MakeBlock.
+  sonar.dWrite2(LOW);
+  delayMicroseconds(2);
+  sonar.dWrite2(HIGH);
+  delayMicroseconds(10);
+  sonar.dWrite2(LOW);
+  pinMode(sonar.pin2(), INPUT);
+  unsigned long duration = pulseIn(sonar.pin2(), HIGH, SONAR_TIMEOUT_US);
+  float measuredCm = duration / 58.0; // Conversion MakeBlock.
+  if (duration == 0 || measuredCm < SONAR_MIN_CM || measuredCm >= SONAR_MAX_CM) {
+    return;
+  }
+  distanceCm = measuredCm;
+  // Une mesure trop proche reste prioritaire sur le filtre.
+  if (sonarHasPrevious && measuredCm >= OBSTACLE_STOP_DISTANCE_CM - STOP_TOLERANCE_CM) {
+    float change = measuredCm - previousSonarCm;
+    if (change > MAX_SONAR_CHANGE_CM || change < -MAX_SONAR_CHANGE_CM) {
+      sonarChangeDetected = true;
+      return;
+    }
+  }
+  previousSonarCm = measuredCm;
+  sonarHasPrevious = true;
+  sonarReady = true;
 }
 
 float getSegmentDistanceCm() {
@@ -270,7 +335,7 @@ void segment1State(unsigned long cT) {
   bool transitionPivot1 = travelledCm >= SEGMENT_1_DISTANCE_CM;
   if (transitionTimeout) {
     stopMotors();
-    pivotTimeoutDetected = false;
+    faultReason = SEGMENT_1_TIMEOUT;
     firstTime = true;
     appState = FAULT_STATE;
     return;
@@ -294,7 +359,6 @@ void pivot1State(unsigned long cT) {
   if (firstTime) {
     firstTime = false;
     startTime = cT;
-    pivotTimeoutDetected = false;
     spin(FIRST_PIVOT_DEG);
     if (DEBUG_ENABLED) {
       Serial.println("Entree : PIVOT 1 - GAUCHE 90 DEGRES");
@@ -306,7 +370,7 @@ void pivot1State(unsigned long cT) {
   // Le delai maximum reste prioritaire.
   if (transitionTimeout) {
     stopMotors();
-    pivotTimeoutDetected = true;
+    faultReason = PIVOT_1_TIMEOUT;
     firstTime = true;
     appState = FAULT_STATE;
     return;
@@ -314,8 +378,95 @@ void pivot1State(unsigned long cT) {
   if (transitionReady) {
     stopMotors();
     firstTime = true;
-    appState = READY_STATE;
+    appState = SEGMENT_2_STATE;
   }
+}
+
+void segment2State(unsigned long cT) {
+  static bool firstTime = true;
+  static bool segmentStarted = false;
+  static unsigned long startTime = 0;
+  if (firstTime) {
+    firstTime = false;
+    startTime = cT;
+    segmentStarted = false;
+    segment2DistanceCm = 0.0;
+    segment2ExpectedDistanceCm = 0.0;
+    distanceCm = -1.0;
+    sonarPrevious = cT;
+    sonarReady = false;
+    sonarFresh = false;
+    sonarHasPrevious = false;
+    sonarChangeDetected = false;
+    arrivalCount = 0;
+    stopMotors();
+    showProgress(0.0, SECOND_SEGMENT_MARKER_LED);
+    if (DEBUG_ENABLED) {
+      Serial.println("Entree : SEGMENT 2");
+    }
+    return;
+  }
+  if (cT - startTime < SEGMENT_TIMEOUT_MS) {
+    sonarTask(cT);
+  }
+  cT = millis();
+  bool transitionTimeout = cT - startTime >= SEGMENT_TIMEOUT_MS;
+  bool transitionTooClose = sonarReady
+      && distanceCm < OBSTACLE_STOP_DISTANCE_CM - STOP_TOLERANCE_CM;
+  bool transitionBadSonar = sonarChangeDetected;
+  if (transitionTimeout || transitionTooClose || transitionBadSonar) {
+    stopMotors();
+    faultReason = SEGMENT_2_TIMEOUT;
+    if (transitionTooClose) {
+      faultReason = OBSTACLE_TOO_CLOSE;
+    } else if (transitionBadSonar) {
+      faultReason = SONAR_CHANGE;
+    }
+    firstTime = true;
+    appState = FAULT_STATE;
+    return;
+  }
+  if (!sonarReady) {
+    arrivalCount = 0;
+    stopMotors();
+    return;
+  }
+  if (segmentStarted) {
+    segment2DistanceCm = getSegmentDistanceCm();
+    showProgress(segment2DistanceCm / segment2ExpectedDistanceCm, SECOND_SEGMENT_MARKER_LED);
+  }
+  if (sonarFresh) {
+    bool inConfirmationZone = distanceCm <= OBSTACLE_STOP_DISTANCE_CM + STOP_TOLERANCE_CM;
+    if (distanceCm <= OBSTACLE_STOP_DISTANCE_CM
+        || (arrivalCount > 0 && inConfirmationZone)) {
+      arrivalCount++;
+    } else {
+      arrivalCount = 0;
+    }
+  }
+  bool transitionReady = arrivalCount >= ARRIVAL_READINGS;
+  if (arrivalCount > 0) {
+    stopMotors();
+    if (transitionReady) {
+      showProgress(1.0, SECOND_SEGMENT_MARKER_LED);
+      firstTime = true;
+      appState = READY_STATE;
+    }
+    return;
+  }
+  int speed = STRAIGHT_PWM;
+  if (distanceCm - OBSTACLE_STOP_DISTANCE_CM <= SLOW_APPROACH_DISTANCE_CM) {
+    speed = APPROACH_PWM;
+  }
+  if (!segmentStarted) {
+    segmentStarted = true;
+    segmentStartLeftDeg = encoderLeft.getCurPos();
+    segmentStartRightDeg = encoderRight.getCurPos();
+    segment2ExpectedDistanceCm = distanceCm - OBSTACLE_STOP_DISTANCE_CM;
+    goStraight(speed, true);
+    return;
+  }
+  goStraight(speed, false);
 }
 
 void readyState() {
@@ -323,9 +474,9 @@ void readyState() {
   if (firstTime) {
     firstTime = false;
     stopMotors();
-    showProgress(1.0, FIRST_SEGMENT_MARKER_LED);
+    showProgress(1.0, SECOND_SEGMENT_MARKER_LED);
     if (DEBUG_ENABLED) {
-      Serial.println("Entree : PIVOT 1 TERMINE - SEGMENT 2 NON INTEGRE");
+      Serial.println("Entree : SEGMENT 2 TERMINE - SECOND PIVOT NON INTEGRE");
     }
     return;
   }
@@ -338,10 +489,22 @@ void faultState() {
     firstTime = false;
     stopMotors();
     if (DEBUG_ENABLED) {
-      if (pivotTimeoutDetected) {
-        Serial.println("Entree : ARRET - TEMPS MAXIMUM PIVOT 1");
-      } else {
-        Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 1");
+      switch (faultReason) {
+        case PIVOT_1_TIMEOUT:
+          Serial.println("Entree : ARRET - TEMPS MAXIMUM PIVOT 1");
+          break;
+        case SEGMENT_2_TIMEOUT:
+          Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 2");
+          break;
+        case SONAR_CHANGE:
+          Serial.println("Entree : ARRET - VARIATION SONAR ABERRANTE");
+          break;
+        case OBSTACLE_TOO_CLOSE:
+          Serial.println("Entree : ARRET - OBSTACLE TROP PROCHE");
+          break;
+        default:
+          Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 1");
+          break;
       }
     }
     return;
@@ -360,7 +523,19 @@ void serialTask(unsigned long cT) {
   Serial.print(" ms | Etat : ");
   Serial.print((int)appState);
   Serial.print(" | Distance : ");
-  Serial.print(segment1DistanceCm, 1);
+  if (appState == SEGMENT_2_STATE || appState == READY_STATE
+      || (appState == FAULT_STATE && faultReason != SEGMENT_1_TIMEOUT
+          && faultReason != PIVOT_1_TIMEOUT)) {
+    Serial.print(segment2DistanceCm, 1);
+  } else {
+    Serial.print(segment1DistanceCm, 1);
+  }
+  Serial.print(" cm | Sonar : ");
+  if (sonarReady) {
+    Serial.print(distanceCm, 1);
+  } else {
+    Serial.print("INVALIDE");
+  }
   Serial.print(" cm | Angle Z : ");
   Serial.println(gyro.getAngleZ(), 1);
 }
