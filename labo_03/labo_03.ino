@@ -1,17 +1,18 @@
 #include <MeAuriga.h>
 
-// Labo 03 : integration 4 du prototype existant.
+// Labo 03 : integration 5 du prototype existant.
 // DA 2409626, derniers chiffres 26 : gauche puis droite.
-// Version partielle : arret apres le segment 2, sans second pivot.
+// Version partielle : arret apres le segment 3, sans pivot final.
 
 #define LEDNUM 12
 #define LEDPIN 44
 
 enum AppState { SETUP_STATE, SEGMENT_1_STATE, PIVOT_1_STATE, SEGMENT_2_STATE,
-                READY_STATE, FAULT_STATE };
+                PIVOT_2_STATE, SEGMENT_3_STATE, READY_STATE, FAULT_STATE };
 AppState appState = SETUP_STATE;
 enum FaultReason { SEGMENT_1_TIMEOUT, PIVOT_1_TIMEOUT, SEGMENT_2_TIMEOUT,
-                   SONAR_CHANGE, OBSTACLE_TOO_CLOSE };
+                   SONAR_CHANGE, OBSTACLE_TOO_CLOSE, PIVOT_2_TIMEOUT,
+                   SEGMENT_3_TIMEOUT };
 FaultReason faultReason = SEGMENT_1_TIMEOUT;
 
 MeRGBLed led(PORT0, LEDNUM);
@@ -25,8 +26,10 @@ const float ENCODER_RATIO = 39.267;
 const float WHEEL_CIRCUMFERENCE_CM = 20.26;
 const float FULL_SPIN_CIRCUMFERENCE_CM = 47.44;
 const int FIRST_PIVOT_DEG = -90;
+const int SECOND_PIVOT_DEG = 90;
 const int PIVOT_SPEED_RPM = 60;
 const float SEGMENT_1_DISTANCE_CM = 100.0; // X a remplacer a l'evaluation.
+const float SEGMENT_3_DISTANCE_CM = 100.0; // X a remplacer a l'evaluation.
 const int STRAIGHT_PWM = 120;
 const int APPROACH_PWM = 80;
 const float SLOW_APPROACH_DISTANCE_CM = 15.0;
@@ -46,6 +49,7 @@ const int PROGRESS_LED_COUNT = 7;
 const int START_MARKER_LED = 8;
 const int FIRST_SEGMENT_MARKER_LED = 12;
 const int SECOND_SEGMENT_MARKER_LED = 11;
+const int THIRD_SEGMENT_MARKER_LED = 10;
 const int LED_BRIGHTNESS = 10;
 const unsigned long START_DELAY_MS = 3000;
 const unsigned long SERIAL_RATE_MS = 250;
@@ -60,6 +64,7 @@ float segment1DistanceCm = 0.0;
 bool pivotSettling = false;
 unsigned long pivotReachedTime = 0;
 float segment2DistanceCm = 0.0;
+float segment3DistanceCm = 0.0;
 float segment2ExpectedDistanceCm = 0.0;
 float distanceCm = -1.0;
 float previousSonarCm = 0.0;
@@ -147,6 +152,12 @@ void stateManager(unsigned long cT) {
     case SEGMENT_2_STATE:
       segment2State(cT);
       break;
+    case PIVOT_2_STATE:
+      pivot2State(cT);
+      break;
+    case SEGMENT_3_STATE:
+      segment3State(cT);
+      break;
     case READY_STATE:
       readyState();
       break;
@@ -178,8 +189,11 @@ void showProgress(float progress, int stageLed) {
     led.setColor(i, 0, 0, LED_BRIGHTNESS);
   }
   led.setColor(stageLed, 0, LED_BRIGHTNESS, 0);
-  if (stageLed == SECOND_SEGMENT_MARKER_LED) {
+  if (stageLed == SECOND_SEGMENT_MARKER_LED || stageLed == THIRD_SEGMENT_MARKER_LED) {
     led.setColor(FIRST_SEGMENT_MARKER_LED, 0, LED_BRIGHTNESS, 0);
+  }
+  if (stageLed == THIRD_SEGMENT_MARKER_LED) {
+    led.setColor(SECOND_SEGMENT_MARKER_LED, 0, LED_BRIGHTNESS, 0);
   }
   led.show();
 }
@@ -444,13 +458,13 @@ void segment2State(unsigned long cT) {
       arrivalCount = 0;
     }
   }
-  bool transitionReady = arrivalCount >= ARRIVAL_READINGS;
+  bool transitionPivot2 = arrivalCount >= ARRIVAL_READINGS;
   if (arrivalCount > 0) {
     stopMotors();
-    if (transitionReady) {
+    if (transitionPivot2) {
       showProgress(1.0, SECOND_SEGMENT_MARKER_LED);
       firstTime = true;
-      appState = READY_STATE;
+      appState = PIVOT_2_STATE;
     }
     return;
   }
@@ -469,14 +483,85 @@ void segment2State(unsigned long cT) {
   goStraight(speed, false);
 }
 
+void pivot2State(unsigned long cT) {
+  static bool firstTime = true;
+  static unsigned long startTime = 0;
+  if (firstTime) {
+    firstTime = false;
+    startTime = cT;
+    sonarReady = false;
+    sonarFresh = false;
+    spin(SECOND_PIVOT_DEG);
+    if (DEBUG_ENABLED) {
+      Serial.println("Entree : PIVOT 2 - DROITE 90 DEGRES");
+    }
+    return;
+  }
+  bool transitionTimeout = cT - startTime >= PIVOT_TIMEOUT_MS;
+  bool transitionSegment3 = pivotReached(cT);
+  if (transitionTimeout) {
+    stopMotors();
+    faultReason = PIVOT_2_TIMEOUT;
+    firstTime = true;
+    appState = FAULT_STATE;
+    return;
+  }
+  if (transitionSegment3) {
+    stopMotors();
+    firstTime = true;
+    appState = SEGMENT_3_STATE;
+  }
+}
+
+void segment3State(unsigned long cT) {
+  static bool firstTime = true;
+  static unsigned long startTime = 0;
+  if (firstTime) {
+    firstTime = false;
+    startTime = cT;
+    segmentStartLeftDeg = encoderLeft.getCurPos();
+    segmentStartRightDeg = encoderRight.getCurPos();
+    segment3DistanceCm = 0.0;
+    showProgress(0.0, THIRD_SEGMENT_MARKER_LED);
+    goStraight(STRAIGHT_PWM, true);
+    if (DEBUG_ENABLED) {
+      Serial.println("Entree : SEGMENT 3");
+    }
+    return;
+  }
+  float travelledCm = getSegmentDistanceCm();
+  segment3DistanceCm = travelledCm;
+  showProgress(travelledCm / SEGMENT_3_DISTANCE_CM, THIRD_SEGMENT_MARKER_LED);
+  bool transitionTimeout = cT - startTime >= SEGMENT_TIMEOUT_MS;
+  bool transitionReady = travelledCm >= SEGMENT_3_DISTANCE_CM;
+  if (transitionTimeout) {
+    stopMotors();
+    faultReason = SEGMENT_3_TIMEOUT;
+    firstTime = true;
+    appState = FAULT_STATE;
+    return;
+  }
+  if (transitionReady) {
+    stopMotors();
+    firstTime = true;
+    appState = READY_STATE;
+    return;
+  }
+  int speed = STRAIGHT_PWM;
+  if (SEGMENT_3_DISTANCE_CM - travelledCm <= SLOW_APPROACH_DISTANCE_CM) {
+    speed = APPROACH_PWM;
+  }
+  goStraight(speed, false);
+}
+
 void readyState() {
   static bool firstTime = true;
   if (firstTime) {
     firstTime = false;
     stopMotors();
-    showProgress(1.0, SECOND_SEGMENT_MARKER_LED);
+    showProgress(1.0, THIRD_SEGMENT_MARKER_LED);
     if (DEBUG_ENABLED) {
-      Serial.println("Entree : SEGMENT 2 TERMINE - SECOND PIVOT NON INTEGRE");
+      Serial.println("Entree : SEGMENT 3 TERMINE - PIVOT FINAL NON INTEGRE");
     }
     return;
   }
@@ -495,6 +580,12 @@ void faultState() {
           break;
         case SEGMENT_2_TIMEOUT:
           Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 2");
+          break;
+        case PIVOT_2_TIMEOUT:
+          Serial.println("Entree : ARRET - TEMPS MAXIMUM PIVOT 2");
+          break;
+        case SEGMENT_3_TIMEOUT:
+          Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 3");
           break;
         case SONAR_CHANGE:
           Serial.println("Entree : ARRET - VARIATION SONAR ABERRANTE");
@@ -523,9 +614,13 @@ void serialTask(unsigned long cT) {
   Serial.print(" ms | Etat : ");
   Serial.print((int)appState);
   Serial.print(" | Distance : ");
-  if (appState == SEGMENT_2_STATE || appState == READY_STATE
-      || (appState == FAULT_STATE && faultReason != SEGMENT_1_TIMEOUT
-          && faultReason != PIVOT_1_TIMEOUT)) {
+  if (appState == SEGMENT_3_STATE || appState == READY_STATE
+      || (appState == FAULT_STATE && faultReason == SEGMENT_3_TIMEOUT)) {
+    Serial.print(segment3DistanceCm, 1);
+  } else if (appState == SEGMENT_2_STATE || appState == PIVOT_2_STATE
+      || (appState == FAULT_STATE && (faultReason == SEGMENT_2_TIMEOUT
+          || faultReason == SONAR_CHANGE || faultReason == OBSTACLE_TOO_CLOSE
+          || faultReason == PIVOT_2_TIMEOUT))) {
     Serial.print(segment2DistanceCm, 1);
   } else {
     Serial.print(segment1DistanceCm, 1);
