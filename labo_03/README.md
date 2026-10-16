@@ -3,13 +3,13 @@ Labo 03
 DA : 2409626, derniers chiffres 26 : premier pivot gauche, deuxieme pivot droite.
 
 Pour l'instant :
-Ajout du pivot droite 90 degres et du segment 3 du prototype; arret avant le pivot final.
+Parcours principal du prototype integre : trois segments, pivots 90/90/180 degres.
 Sonar PORT_10 lu toutes les 100 ms, avec attente d'echo limitee a 25 ms.
 Arret a 30 cm confirme par trois lectures dans 28-32 cm; trop proche = erreur, pas reussite.
-DEL 1 a 7 progressives; temoins 12, 11 puis 10 verts conserves. Traces serie toutes les 250 ms.
+DEL 1 a 7 progressives; temoins 12/11/10 cumules, puis 8 a 12 vertes, 50 ms ON/50 ms OFF (10 Hz).
 Segments 1 et 3 : 100 cm provisoires, a remplacer par X. Arret si un mouvement prend trop de temps.
-Le code compile pour Mega AVR 1.8.6; 35 essais sur ordinateur passent. Mesures reelles a verifier.
-Suite : pivot final et clignotement. Aucun envoi automatique au robot.
+Le code compile pour Mega AVR 1.8.6; 44 essais sur ordinateur passent. Mesures reelles a verifier.
+Restent les essais physiques, le formulaire Git et le ZIP sur Lea. Aucun envoi automatique au robot.
 
 Cours utilises :
 - [FSM avec firstTime](https://github.com/nbourre/1SX_robotique/blob/0941ad14f74b80703fee6ec92e0c7fbae76611d9/autres/modele_fsm/modele_fsm.ino)

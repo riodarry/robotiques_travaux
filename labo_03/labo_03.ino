@@ -1,18 +1,19 @@
 #include <MeAuriga.h>
 
-// Labo 03 : integration 5 du prototype existant.
+// Labo 03 : integration 6 du prototype existant.
 // DA 2409626, derniers chiffres 26 : gauche puis droite.
-// Version partielle : arret apres le segment 3, sans pivot final.
+// Parcours principal integre; distances et angles physiques a verifier.
 
 #define LEDNUM 12
 #define LEDPIN 44
 
 enum AppState { SETUP_STATE, SEGMENT_1_STATE, PIVOT_1_STATE, SEGMENT_2_STATE,
-                PIVOT_2_STATE, SEGMENT_3_STATE, READY_STATE, FAULT_STATE };
+                PIVOT_2_STATE, SEGMENT_3_STATE, PIVOT_180_STATE,
+                FINISHED_STATE, FAULT_STATE };
 AppState appState = SETUP_STATE;
 enum FaultReason { SEGMENT_1_TIMEOUT, PIVOT_1_TIMEOUT, SEGMENT_2_TIMEOUT,
                    SONAR_CHANGE, OBSTACLE_TOO_CLOSE, PIVOT_2_TIMEOUT,
-                   SEGMENT_3_TIMEOUT };
+                   SEGMENT_3_TIMEOUT, PIVOT_180_TIMEOUT };
 FaultReason faultReason = SEGMENT_1_TIMEOUT;
 
 MeRGBLed led(PORT0, LEDNUM);
@@ -27,6 +28,7 @@ const float WHEEL_CIRCUMFERENCE_CM = 20.26;
 const float FULL_SPIN_CIRCUMFERENCE_CM = 47.44;
 const int FIRST_PIVOT_DEG = -90;
 const int SECOND_PIVOT_DEG = 90;
+const int FINAL_PIVOT_DEG = -180;
 const int PIVOT_SPEED_RPM = 60;
 const float SEGMENT_1_DISTANCE_CM = 100.0; // X a remplacer a l'evaluation.
 const float SEGMENT_3_DISTANCE_CM = 100.0; // X a remplacer a l'evaluation.
@@ -50,12 +52,14 @@ const int START_MARKER_LED = 8;
 const int FIRST_SEGMENT_MARKER_LED = 12;
 const int SECOND_SEGMENT_MARKER_LED = 11;
 const int THIRD_SEGMENT_MARKER_LED = 10;
+const int FINISH_FIRST_LED = 8;
 const int LED_BRIGHTNESS = 10;
 const unsigned long START_DELAY_MS = 3000;
 const unsigned long SERIAL_RATE_MS = 250;
 const unsigned long SEGMENT_TIMEOUT_MS = 20000;
 const unsigned long PIVOT_TIMEOUT_MS = 6000;
 const unsigned long PIVOT_SETTLE_MS = 200;
+const unsigned long FINISH_TOGGLE_MS = 50; // 50 ms ON + 50 ms OFF = 10 Hz.
 const bool DEBUG_ENABLED = true;
 unsigned long currentTime = 0;
 long segmentStartLeftDeg = 0;
@@ -158,8 +162,11 @@ void stateManager(unsigned long cT) {
     case SEGMENT_3_STATE:
       segment3State(cT);
       break;
-    case READY_STATE:
-      readyState();
+    case PIVOT_180_STATE:
+      pivot180State(cT);
+      break;
+    case FINISHED_STATE:
+      finishedState(cT);
       break;
     case FAULT_STATE:
       faultState();
@@ -301,6 +308,30 @@ bool pivotReached(unsigned long cT) {
     return false;
   }
   return cT - pivotReachedTime >= PIVOT_SETTLE_MS;
+}
+
+void finishLedTask(unsigned long cT, bool firstRun) {
+  static unsigned long lastTime = 0;
+  static bool ledsOn = false;
+  if (firstRun) {
+    lastTime = cT;
+    ledsOn = false;
+    led.setColor(0, 0, 0);
+    led.show();
+    return;
+  }
+  if (cT - lastTime < FINISH_TOGGLE_MS) {
+    return;
+  }
+  lastTime = cT;
+  ledsOn = !ledsOn;
+  led.setColor(0, 0, 0);
+  if (ledsOn) {
+    for (int i = FINISH_FIRST_LED; i <= LEDNUM; i++) {
+      led.setColor(i, 0, LED_BRIGHTNESS, 0);
+    }
+  }
+  led.show();
 }
 
 void setupState(unsigned long cT) {
@@ -533,7 +564,7 @@ void segment3State(unsigned long cT) {
   segment3DistanceCm = travelledCm;
   showProgress(travelledCm / SEGMENT_3_DISTANCE_CM, THIRD_SEGMENT_MARKER_LED);
   bool transitionTimeout = cT - startTime >= SEGMENT_TIMEOUT_MS;
-  bool transitionReady = travelledCm >= SEGMENT_3_DISTANCE_CM;
+  bool transitionPivot180 = travelledCm >= SEGMENT_3_DISTANCE_CM;
   if (transitionTimeout) {
     stopMotors();
     faultReason = SEGMENT_3_TIMEOUT;
@@ -541,10 +572,10 @@ void segment3State(unsigned long cT) {
     appState = FAULT_STATE;
     return;
   }
-  if (transitionReady) {
+  if (transitionPivot180) {
     stopMotors();
     firstTime = true;
-    appState = READY_STATE;
+    appState = PIVOT_180_STATE;
     return;
   }
   int speed = STRAIGHT_PWM;
@@ -554,18 +585,47 @@ void segment3State(unsigned long cT) {
   goStraight(speed, false);
 }
 
-void readyState() {
+void pivot180State(unsigned long cT) {
+  static bool firstTime = true;
+  static unsigned long startTime = 0;
+  if (firstTime) {
+    firstTime = false;
+    startTime = cT;
+    spin(FINAL_PIVOT_DEG);
+    if (DEBUG_ENABLED) {
+      Serial.println("Entree : PIVOT FINAL - 180 DEGRES");
+    }
+    return;
+  }
+  bool transitionTimeout = cT - startTime >= PIVOT_TIMEOUT_MS;
+  bool transitionFinished = pivotReached(cT);
+  if (transitionTimeout) {
+    stopMotors();
+    faultReason = PIVOT_180_TIMEOUT;
+    firstTime = true;
+    appState = FAULT_STATE;
+    return;
+  }
+  if (transitionFinished) {
+    stopMotors();
+    firstTime = true;
+    appState = FINISHED_STATE;
+  }
+}
+
+void finishedState(unsigned long cT) {
   static bool firstTime = true;
   if (firstTime) {
     firstTime = false;
     stopMotors();
-    showProgress(1.0, THIRD_SEGMENT_MARKER_LED);
+    finishLedTask(cT, true);
     if (DEBUG_ENABLED) {
-      Serial.println("Entree : SEGMENT 3 TERMINE - PIVOT FINAL NON INTEGRE");
+      Serial.println("Entree : FIN");
     }
     return;
   }
   stopMotors();
+  finishLedTask(cT, false);
 }
 
 void faultState() {
@@ -586,6 +646,9 @@ void faultState() {
           break;
         case SEGMENT_3_TIMEOUT:
           Serial.println("Entree : ARRET - TEMPS MAXIMUM SEGMENT 3");
+          break;
+        case PIVOT_180_TIMEOUT:
+          Serial.println("Entree : ARRET - TEMPS MAXIMUM PIVOT FINAL");
           break;
         case SONAR_CHANGE:
           Serial.println("Entree : ARRET - VARIATION SONAR ABERRANTE");
@@ -614,8 +677,10 @@ void serialTask(unsigned long cT) {
   Serial.print(" ms | Etat : ");
   Serial.print((int)appState);
   Serial.print(" | Distance : ");
-  if (appState == SEGMENT_3_STATE || appState == READY_STATE
-      || (appState == FAULT_STATE && faultReason == SEGMENT_3_TIMEOUT)) {
+  if (appState == SEGMENT_3_STATE || appState == PIVOT_180_STATE
+      || appState == FINISHED_STATE
+      || (appState == FAULT_STATE && (faultReason == SEGMENT_3_TIMEOUT
+          || faultReason == PIVOT_180_TIMEOUT))) {
     Serial.print(segment3DistanceCm, 1);
   } else if (appState == SEGMENT_2_STATE || appState == PIVOT_2_STATE
       || (appState == FAULT_STATE && (faultReason == SEGMENT_2_TIMEOUT
